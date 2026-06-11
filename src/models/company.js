@@ -10,6 +10,26 @@ const CompanySchema = new mongoose.Schema(
       type: String,
       trim: true
     },
+    email: {
+      type: String,
+      trim: true
+    },
+    phone: {
+      type: String,
+      trim: true
+    },
+    address: {
+      type: String,
+      trim: true
+    },
+    city: {
+      type: String,
+      trim: true
+    },
+    country: {
+      type: String,
+      trim: true
+    },
     status: {
       type: Number,
       default: 1

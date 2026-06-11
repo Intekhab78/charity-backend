@@ -93,6 +93,7 @@ exports.createCustomer = async (req, res) => {
 exports.updateCustomer = async (req, res) => {
   try {
     const { id } = req.params;
+    console.log("[UPDATE CUSTOMER] id:", id, "body:", req.body);
     const conditions = [];
     if (!isNaN(id)) conditions.push({ id: Number(id) });
     if (/^[0-9a-fA-F]{24}$/.test(id)) conditions.push({ _id: id });
@@ -111,8 +112,10 @@ exports.updateCustomer = async (req, res) => {
 
     customer.set(updateData);
     await customer.save();
+    console.log("[UPDATE CUSTOMER] Success for id:", id);
     res.status(200).json({ success: true, message: "Customer updated successfully" });
   } catch (error) {
+    console.error("[UPDATE CUSTOMER ERROR]:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };

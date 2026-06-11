@@ -1,13 +1,14 @@
+// ⚠️ MUST be first — loads .env before any other module reads process.env
+const dotenv = require("dotenv");
+dotenv.config();
+
 const express = require("express");
 const cors = require("cors");
-const dotenv = require("dotenv");
 const fs = require("fs");
 const db = require("./models");
 const routes = require("./routes");
 
 const connectDB = require("./config/db");
-
-dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 5620;
@@ -73,10 +74,24 @@ app.use("/api", routes);
 
 // Connect to MongoDB & Start Server
 connectDB().then(() => {
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     console.log(`🚀 New Backend running at http://localhost:${port}`);
   });
+
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`❌ Port ${port} is already in use. Kill the old process and retry.`);
+      process.exit(1);
+    } else {
+      throw err;
+    }
+  });
+
+  // Graceful shutdown — releases the port cleanly on Ctrl+C / nodemon restart
+  const shutdown = () => { server.close(() => process.exit(0)); };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+
 }).catch(err => {
   console.error("❌ Failed to launch new backend due to connection error:", err);
 });
-// Nodemon refresh trigger

@@ -67,12 +67,15 @@ exports.update = async (req, res) => {
 exports.delete = async (req, res) => {
   try {
     const { id } = req.params;
+    console.log("[DELETE] Attempting to delete qurbani_date_master with id:", id);
     const result = await db.qurbani_date_master.deleteOne({ id: Number(id) });
+    console.log("[DELETE] Result:", result);
     if (result.deletedCount === 0) {
       return res.status(404).json({ success: false, message: "Record not found" });
     }
     res.status(200).json({ success: true, message: "Qurbani Date deleted successfully" });
   } catch (error) {
+    console.error("[DELETE ERROR] qurbani_date_master:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };

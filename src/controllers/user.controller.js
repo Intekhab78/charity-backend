@@ -26,6 +26,9 @@ exports.createVendor = async (req, res) => {
 
     const nextId = await getNextId(db.user_master);
 
+    // Hash password before storing — NEVER store plain text
+    const hashedPassword = await bcrypt.hash(password, 10);
+
     // Prepare full data with all possible ERP required fields
     const userData = {
       id: nextId,
@@ -33,7 +36,7 @@ exports.createVendor = async (req, res) => {
       firstname,
       lastname,
       email,
-      password,
+      password: hashedPassword,
       mobile,
       role_id: DEFAULT_VENDOR_ROLE_ID,
       status: 1,

@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 const itemController = require("../controllers/item.controller");
 const charityController = require("../controllers/charity.controller");
 const companyController = require("../controllers/company.controller");
@@ -16,6 +17,15 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 
+// Rate limiter — max 10 login attempts per 15 minutes per IP
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { success: false, message: "Too many login attempts. Please try again in 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     const uploadDir = path.join(__dirname, "../../uploads");
@@ -28,7 +38,17 @@ const storage = multer.diskStorage({
     cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, '-'));
   },
 });
-const upload = multer({ storage: storage });
+
+// File filter — only allow images, max 5MB
+const fileFilter = (req, file, cb) => {
+  const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif'];
+  if (allowed.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Only image files (JPEG, PNG, WebP, GIF) are allowed.'), false);
+  }
+};
+const upload = multer({ storage, fileFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 // Admin Auth Middleware
 const JWT_SECRET = process.env.JWT_SECRET;
 
@@ -61,7 +81,10 @@ const adminOnly = (req, res, next) => {
 };
 
 // Auth
-router.post("/auth/login", authController.login);
+router.post("/auth/login", loginLimiter, authController.login);
+router.get("/auth/me", authRequired, authController.getMe);
+router.post("/auth/change-password", authRequired, authController.changePassword);
+router.post("/auth/upload-avatar", authRequired, upload.single('avatar'), authController.uploadAvatar);
 
 // Setup
 router.get("/setup", async (req, res) => {
@@ -153,18 +176,22 @@ router.put("/customers/:id", adminOnly, upload.single("profile_image"), customer
 router.delete("/customers/:id", adminOnly, customerController.deleteCustomer);
 
 // Qurbani Booking Management
-router.get("/bookings", qurbaniController.listBookings);
-router.get("/bookings/years", qurbaniController.getAvailableYears);
-router.get("/bookings/collection-summary", qurbaniController.getCollectionSummary);
-router.get("/bookings/comparison-summary", qurbaniController.getComparisonSummary);
-router.post("/bookings", qurbaniController.createBooking);
-router.put("/bookings/:id", qurbaniController.updateBooking);
-router.delete("/bookings/:id", qurbaniController.deleteBooking);
+router.get("/bookings", authRequired, qurbaniController.listBookings);
+router.get("/bookings/years", authRequired, qurbaniController.getAvailableYears);
+router.get("/bookings/collection-summary", authRequired, qurbaniController.getCollectionSummary);
+router.get("/bookings/comparison-summary", authRequired, qurbaniController.getComparisonSummary);
+router.get("/bookings/search", authRequired, qurbaniController.searchBookingByRegNo);
+router.post("/bookings", authRequired, qurbaniController.createBooking);
+router.put("/bookings/:id", authRequired, qurbaniController.updateBooking);
+router.delete("/bookings/:id", adminOnly, qurbaniController.deleteBooking);
 router.post("/bookings/:id/approve", adminOnly, qurbaniController.approveBooking);
+router.post("/bookings/:id/reject", adminOnly, qurbaniController.rejectBooking);
+router.post("/bookings/bulk-approve", adminOnly, qurbaniController.bulkApproveBookings);
 router.post("/qurbani-shares/mark-done", authRequired, qurbaniController.markSharesQurbaniDone);
-router.get("/share-codes", qurbaniController.listShareCodes);
-router.get("/departments", qurbaniController.listDepartments);
+router.get("/share-codes", authRequired, qurbaniController.listShareCodes);
+router.get("/departments", authRequired, qurbaniController.listDepartments);
 router.get("/company", qurbaniController.getCompany);
+router.put("/company", adminOnly, qurbaniController.updateCompany);
 
 // Qurbani Date Master CRUD routes (Create/Update/Delete gated by adminOnly)
 router.get("/qurbani-dates", qurbanidateController.list);

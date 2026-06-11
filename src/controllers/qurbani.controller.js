@@ -1,11 +1,24 @@
 const db = require("../models");
 const crypto = require("crypto");
+const emailService = require("../services/email.service");
 const mongoose = require("mongoose");
 const { DEFAULT_COMPANY_ID, DEFAULT_LOCATION_ID, DEFAULT_ORGANISATION_ID } = require("../config/defaults");
 
 const getNextId = async (model) => {
   const lastRecord = await model.findOne().sort({ id: -1 });
   return lastRecord && typeof lastRecord.id === "number" ? lastRecord.id + 1 : 1001;
+};
+
+const getVendorQuery = async (req) => {
+  if (req.user && !req.user.role?.toLowerCase().includes('admin')) {
+    const userRecord = await db.user_master.findOne({ $or: [{ id: req.user.id }, { _id: req.user._id }] }).lean();
+    if (userRecord) {
+      const vendorName = `${userRecord.firstname || ""} ${userRecord.lastname || ""}`.trim();
+      return { vendor_name: vendorName };
+    }
+    return { vendor_name: "UNAUTHORIZED_VENDOR" };
+  }
+  return {};
 };
 
 const findBookingByIdOrUuid = async (id) => {
@@ -177,7 +190,8 @@ exports.listBookings = async (req, res) => {
       console.error("Website order migration skipped:", migrationError.message);
     }
 
-    const bookings = await db.qurbani_booking.find().sort({ created_at: -1 }).lean();
+    const query = await getVendorQuery(req);
+    const bookings = await db.qurbani_booking.find(query).sort({ created_at: -1 }).lean();
     for (let booking of bookings) {
       booking.shares = await db.qurbani_share.find({ booking_id: booking._id }).lean();
     }
@@ -200,7 +214,12 @@ exports.listBookings = async (req, res) => {
       orderBookings.push(await buildOrderBooking(order));
     }
 
-    const mergedBookings = [...bookings, ...orderBookings].sort((a, b) => {
+    const mergedBookings = [...bookings, ...orderBookings].filter(b => {
+      if (query.vendor_name) {
+        return b.vendor_name === query.vendor_name;
+      }
+      return true;
+    }).sort((a, b) => {
       const aDate = new Date(a.booking_date || a.created_at || 0).getTime();
       const bDate = new Date(b.booking_date || b.created_at || 0).getTime();
       return bDate - aDate;
@@ -254,22 +273,21 @@ exports.listShareCodes = async (req, res) => {
 
 exports.listDepartments = async (req, res) => {
   try {
-    const filters = [];
-    if (DEFAULT_COMPANY_ID !== null) filters.push({ company_id: DEFAULT_COMPANY_ID });
-    if (DEFAULT_ORGANISATION_ID !== null) filters.push({ organisation_id: DEFAULT_ORGANISATION_ID });
-    const query = filters.length > 0 ? { $or: filters } : {};
-    const list = await db.item_department.find(query, "id itemdeptname").sort({ itemdeptname: 1 }).lean();
+    // item_department only has company_id and location_id fields (no organisation_id)
+    // Only filter by company_id if DEFAULT_COMPANY_ID is configured; otherwise return all
+    const query = DEFAULT_COMPANY_ID !== null ? { company_id: DEFAULT_COMPANY_ID } : {};
+    const list = await db.item_department.find(query, "id itemdeptname deptname").sort({ itemdeptname: 1 }).lean();
 
-    const results = list.map(d => ({
-      id: d.id,
-      dept_name: d.itemdeptname
-    }));
+    const results = list
+      .map(d => ({ id: d.id, dept_name: d.itemdeptname || d.deptname || '' }))
+      .filter(d => d.dept_name);
 
     res.status(200).json({ success: true, data: results });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
 
 exports.getCompany = async (req, res) => {
   try {
@@ -339,6 +357,13 @@ exports.createBooking = async (req, res) => {
       is_approved_by_admin
     } = req.body;
     
+    if (total_shares > 7 || (shares && shares.length > 7)) {
+      return res.status(400).json({ success: false, message: 'A booking cannot exceed 7 shares.' });
+    }
+    if (shares && shares.some(s => Number(s.amount) <= 0)) {
+      return res.status(400).json({ success: false, message: 'All share amounts must be greater than 0.' });
+    }
+    
     const nextId = await getNextId(db.qurbani_booking);
     const booking = await db.qurbani_booking.create({
       id: nextId,
@@ -351,6 +376,10 @@ exports.createBooking = async (req, res) => {
       company_id: Number(req.body.company_id) || DEFAULT_COMPANY_ID,
       location_id: Number(req.body.location_id) || DEFAULT_LOCATION_ID
     });
+    await booking.save();
+
+    // Delete old shares and recreate
+    await db.qurbani_share.deleteMany({ booking_id: booking._id });
 
     const shareData = shares.map((s, index) => ({
       booking_id: booking._id,
@@ -366,7 +395,15 @@ exports.createBooking = async (req, res) => {
       await db.qurbani_share.create({ ...share, id: nextShareId });
     }
 
-    res.status(201).json({ success: true, message: "Booking Created", data: booking });
+    if (customer_email) {
+      try {
+        await emailService.sendBookingSuccessEmail(customer_email, customer_name, booking, shareData);
+      } catch (err) {
+        console.error("Failed to send success email:", err);
+      }
+    }
+
+    res.status(200).json({ success: true, message: "Booking Updated" });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -381,25 +418,39 @@ exports.updateBooking = async (req, res) => {
     const { 
       customer_name, customer_phone, customer_email, 
       total_shares, share_code, total_amount, 
-      payment_mode, shares, qurbani_date 
+      payment_mode, shares, vendor_name, qurbani_date,
+      is_approved_by_admin
     } = req.body;
 
     const booking = await findBookingByIdOrUuid(id);
     if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
 
-    booking.set({
-      customer_name, customer_phone, customer_email,
-      total_shares, share_code, total_amount, payment_mode,
-      qurbani_date
-    });
+    if (total_shares > 7 || (shares && shares.length > 7)) {
+      return res.status(400).json({ success: false, message: 'A booking cannot exceed 7 shares.' });
+    }
+    if (shares && shares.some(s => Number(s.amount) <= 0)) {
+      return res.status(400).json({ success: false, message: 'All share amounts must be greater than 0.' });
+    }
+
+    booking.customer_name = customer_name;
+    booking.customer_phone = customer_phone;
+    booking.customer_email = customer_email;
+    booking.total_shares = total_shares;
+    booking.share_code = share_code;
+    booking.total_amount = total_amount;
+    booking.payment_mode = payment_mode;
+    booking.qurbani_date = qurbani_date;
+    if (vendor_name !== undefined) booking.vendor_name = vendor_name;
+    if (is_approved_by_admin !== undefined) booking.is_approved_by_admin = Number(is_approved_by_admin);
+    
     await booking.save();
 
-    // Delete old shares and recreate
+    // Recreate shares
     await db.qurbani_share.deleteMany({ booking_id: booking._id });
 
     const shareData = shares.map((s, index) => ({
       booking_id: booking._id,
-      share_reg_no: s.share_reg_no || `REG/${new Date().getFullYear()}/${Math.floor(Math.random()*10000)}/${index+1}`,
+      share_reg_no: s.share_reg_no || `REG/${new Date().getFullYear()}/${booking.id || id}/${index+1}`,
       beneficiary_name: s.beneficiary_name,
       beneficiary_mobile: s.beneficiary_mobile,
       objective: s.objective || "",
@@ -447,7 +498,33 @@ exports.approveBooking = async (req, res) => {
     booking.is_approved_by_admin = 1;
     await booking.save();
 
+    if (booking.customer_email) {
+      try {
+        await emailService.sendBookingApprovedEmail(booking.customer_email, booking.customer_name, booking);
+      } catch (err) {
+        console.error("Failed to send booking approval email:", err);
+      }
+    }
+
     res.status(200).json({ success: true, message: "Booking Approved successfully!" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * REJECT QURBANI BOOKING (Admin-only)
+ */
+exports.rejectBooking = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const booking = await findBookingByIdOrUuid(id);
+    if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
+
+    booking.is_approved_by_admin = 2; // 2 = Rejected
+    await booking.save();
+
+    res.status(200).json({ success: true, message: "Booking Rejected successfully!" });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -480,6 +557,26 @@ exports.markSharesQurbaniDone = async (req, res) => {
       }
     );
 
+    // Fetch updated shares to send emails
+    const updatedShares = await db.qurbani_share.find({ _id: { $in: ids } }).lean();
+    for (const share of updatedShares) {
+      if (share.booking_id) {
+        const booking = await db.qurbani_booking.findById(share.booking_id).lean();
+        if (booking && booking.customer_email) {
+          try {
+            await emailService.sendQurbaniSuccessEmail(
+              booking.customer_email, 
+              process.env.ADMIN_EMAIL, 
+              booking.customer_name, 
+              share
+            );
+          } catch (err) {
+            console.error("Failed to send qurbani success email:", err);
+          }
+        }
+      }
+    }
+
     res.status(200).json({
       success: true,
       message: "Qurbani marked done and customer message recorded.",
@@ -498,7 +595,8 @@ exports.markSharesQurbaniDone = async (req, res) => {
  */
 exports.getCollectionSummary = async (req, res) => {
   try {
-    const bookings = await db.qurbani_booking.find().lean();
+    const query = await getVendorQuery(req);
+    const bookings = await db.qurbani_booking.find(query).lean();
     
     const summary = {};
     let totalAmount = 0;
@@ -538,7 +636,8 @@ exports.getCollectionSummary = async (req, res) => {
  */
 exports.getComparisonSummary = async (req, res) => {
   try {
-    const bookings = await db.qurbani_booking.find().lean();
+    const query = await getVendorQuery(req);
+    const bookings = await db.qurbani_booking.find(query).lean();
     
     const dayBreakdown = {};
     const yearBreakdown = {};
@@ -568,6 +667,118 @@ exports.getComparisonSummary = async (req, res) => {
       data: {
         days: Object.values(dayBreakdown),
         years: Object.values(yearBreakdown)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.searchBookingByRegNo = async (req, res) => {
+  try {
+    const q = req.query.q || req.query.reg_no || "";
+    if (!q) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const regex = new RegExp(q, "i");
+
+    // 1. Search in qurbani_shares by share_reg_no
+    const matchingShares = await db.qurbani_share.find({ share_reg_no: regex }).lean();
+    const bookingIdsFromShares = matchingShares.map(s => s.booking_id).filter(Boolean);
+
+    // 2. Query bookings by those IDs, customer_name, customer_phone, or source_order_number
+    const vQuery = await getVendorQuery(req);
+    const bookingsQuery = {
+      $and: [
+        vQuery,
+        {
+          $or: [
+            { _id: { $in: bookingIdsFromShares } },
+            { customer_name: regex },
+            { customer_phone: regex },
+            { source_order_number: regex }
+          ]
+        }
+      ]
+    };
+    
+    const bookings = await db.qurbani_booking.find(bookingsQuery).sort({ created_at: -1 }).lean();
+    for (let booking of bookings) {
+      booking.shares = await db.qurbani_share.find({ booking_id: booking._id }).lean();
+    }
+
+    res.status(200).json({ success: true, data: bookings });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.bulkApproveBookings = async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids)) {
+      return res.status(400).json({ success: false, message: "Invalid or missing booking ids" });
+    }
+
+    const objectIds = ids.map(id => {
+      if (mongoose.Types.ObjectId.isValid(id)) {
+        return new mongoose.Types.ObjectId(id);
+      }
+      return id;
+    });
+
+    const result = await db.qurbani_booking.updateMany(
+      {
+        $or: [
+          { _id: { $in: objectIds } },
+          { id: { $in: ids.filter(id => !isNaN(id)).map(Number) } }
+        ]
+      },
+      { $set: { is_approved_by_admin: 1 } }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `Successfully approved ${result.modifiedCount} bookings.`,
+      modifiedCount: result.modifiedCount
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.updateCompany = async (req, res) => {
+  try {
+    const { company_name, email, phone, address, city, country } = req.body;
+    const companyId = DEFAULT_COMPANY_ID !== null ? DEFAULT_COMPANY_ID : 1001;
+
+    let company = await db.company.findOne({ id: companyId });
+    if (!company) {
+      company = new db.company({ id: companyId });
+    }
+
+    company.compdesc = company_name || company.compdesc || "Charity Organisation";
+    company.email = email || "";
+    company.phone = phone || "";
+    company.address = address || "";
+    company.city = city || "";
+    company.country = country || "";
+    company.status = 1;
+
+    await company.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Company details updated successfully",
+      data: {
+        id: company.id,
+        company_name: company.compdesc,
+        email: company.email,
+        phone: company.phone,
+        address: company.address,
+        city: company.city,
+        country: company.country
       }
     });
   } catch (error) {
